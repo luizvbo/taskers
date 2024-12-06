@@ -1,17 +1,42 @@
-use std::{fs, io};
-use std::path::Path;
-use chrono::{DateTime, Local};
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+use chrono::NaiveDateTime;
+use chrono::TimeZone;
+use chrono::{DateTime, Local, Utc};
+use crossterm::event::{self, Event, KeyCode};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::{
-    backend::{CrosstermBackend},
+    backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     widgets::{Block, Borders, List, ListItem},
     Terminal,
 };
-use crossterm::event::{self, Event, KeyCode};
-use crossterm::terminal::{enable_raw_mode, disable_raw_mode};
-use serde_with; 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::path::Path;
+use std::{fs, io};
+use uuid::Uuid;
+
+fn serialize<S>(date: &Option<DateTime<Utc>>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match date {
+        Some(date) => serializer.serialize_i64(date.timestamp()),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn deserialize<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    // Deserialize as an `Option<i64>` (timestamp in seconds)
+    let timestamp: Option<i64> = Option::deserialize(deserializer)?;
+
+    // Convert timestamp to `DateTime<Utc>` if available
+    Ok(timestamp.and_then(|ts| {
+        NaiveDateTime::from_timestamp_opt(ts, 0) 
+            .map(|naive| DateTime::<Utc>::from_utc(naive, Utc)) 
+    }))
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Task {
@@ -19,21 +44,26 @@ struct Task {
     title: String,
     description: Option<String>,
     tags: Vec<String>,
-    #[serde(with = "chrono::serde::ts_seconds")] 
-    created_at: DateTime<Local>, 
-    #[serde(with = "chrono::serde::ts_seconds")] 
-    due_date: Option<DateTime<Local>>,
+    #[serde(with = "chrono::serde::ts_seconds")]
+    created_at: DateTime<Utc>,
+    #[serde(serialize_with = "serialize", deserialize_with = "deserialize")]
+    due_date: Option<DateTime<Utc>>,
 }
 
 impl Task {
-    fn new(title: &str, description: Option<String>, tags: Vec<String>, due_date: Option<DateTime<Local>>) -> Self {
+    fn new(
+        title: &str,
+        description: Option<String>,
+        tags: Vec<String>,
+        due_date: Option<DateTime<Local>>,
+    ) -> Self {
         Self {
             id: Uuid::new_v4(),
             title: title.to_string(),
             description,
             tags,
-            created_at: Local::now(),
-            due_date,
+            created_at: Local::now().into(),
+            due_date: due_date.map(|dt| dt.into()),
         }
     }
 }
@@ -70,7 +100,10 @@ impl KanbanApp {
         let columns = config
             .columns
             .into_iter()
-            .map(|name| Column { name, tasks: Vec::new() })
+            .map(|name| Column {
+                name,
+                tasks: Vec::new(),
+            })
             .collect();
 
         Self {
@@ -134,12 +167,10 @@ impl KanbanApp {
                     .map(|_| Constraint::Percentage(100 / self.columns.len() as u16))
                     .collect::<Vec<_>>(),
             )
-            .split(f.size());
+            .split(f.area()); // Use f.area() instead of f.size()
 
         for (i, column) in self.columns.iter().enumerate() {
-            let block = Block::default()
-                .title(&column.name)
-                .borders(Borders::ALL);
+            let block = Block::default().title(&*column.name).borders(Borders::ALL);
 
             let items: Vec<ListItem> = column
                 .tasks
@@ -187,10 +218,12 @@ impl KanbanApp {
         let tags: Vec<String> = tags.split(',').map(|s| s.trim().to_string()).collect();
 
         let due_date = self.input("Enter due date (YYYY-MM-DD, optional): ");
-        let due_date = due_date
-            .parse::<chrono::NaiveDate>()
-            .ok()
-            .map(|date| Local.from_local_date(&date).unwrap().and_hms(0, 0, 0));
+        let due_date = due_date.parse::<chrono::NaiveDate>().ok().map(|date| {
+            Local
+                .from_local_datetime(&date.and_hms_opt(0, 0, 0).unwrap())
+                .unwrap()
+                .into()
+        });
 
         let task = Task::new(&title, Some(description), tags, due_date);
         self.columns[self.selected_column].tasks.push(task);
